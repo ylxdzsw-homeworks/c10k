@@ -100,7 +100,7 @@ void server_run(const unsigned short rank) {
         for (int i = 0; i < n_events; i++) {
             struct event_data *const event_data = event_buffer[i].data.ptr;
             switch (event_data->status) {
-                case status_listening:
+                case status_listening: ;
                     const int socket_fd = accept4(event_data->fd, NULL, NULL, SOCK_NONBLOCK);
                     if (socket_fd < 0)
                         panic("Error accepting connection");
@@ -117,7 +117,7 @@ void server_run(const unsigned short rank) {
                         panic("Error adding socket to epoll");
                     break;
 
-                case status_reading:
+                case status_reading: ;
                     char buffer[REQUEST_MSG_LEN];
                     const int bytes_read = recv(event_data->fd, buffer, event_data->bytes_remaining, 0);
 
@@ -143,7 +143,7 @@ void server_run(const unsigned short rank) {
                     }
                     break;
 
-                case status_writing:
+                case status_writing: ;
                     const char *msg = response_msg + RESPONSE_MSG_LEN - event_data->bytes_remaining;
                     const int bytes_written = send(event_data->fd, msg, event_data->bytes_remaining, 0);
 
@@ -250,7 +250,7 @@ void client_run(const unsigned short rank) {
         for (int i = 0; i < n_events; i++) {
             struct event_data *const event_data = event_buffer[i].data.ptr;
             switch (event_data->status) {
-                case status_writing:
+                case status_writing: ;
                     const char *msg = request_msg + REQUEST_MSG_LEN - event_data->bytes_remaining;
                     const int bytes_written = send(event_data->fd, msg, event_data->bytes_remaining, 0);
 
@@ -277,7 +277,7 @@ void client_run(const unsigned short rank) {
                     }
                     break;
 
-                case status_reading:
+                case status_reading: ;
                     char buffer[RESPONSE_MSG_LEN];
                     const int bytes_read = recv(event_data->fd, buffer, event_data->bytes_remaining, 0);
 
@@ -327,13 +327,13 @@ void client_entry() {
     }
 
     pthread_barrier_wait(&barrier);
-    printf("connections established. elapsed: %dms\n", get_time_millis() - staring_time);
+    printf("connections established. elapsed: %lldms\n", get_time_millis() - staring_time);
 
     for (unsigned short i = 0; i < n_threads; i++) {
         pthread_join(threads[i], NULL);
     }
 
-    printf("finished. elapsed: %dms\n", get_time_millis() - staring_time);
+    printf("finished. elapsed: %lldms\n", get_time_millis() - staring_time);
 }
 
 int main(const int argc, char *const argv[]) {
