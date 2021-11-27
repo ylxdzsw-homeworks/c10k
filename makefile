@@ -1,2 +1,2 @@
 epoll: epoll.c
-	cc -O3 -o epoll epoll.c
+	cc -O3 -static -lrt -pthread -o epoll epoll.c
