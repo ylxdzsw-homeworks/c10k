@@ -21,13 +21,14 @@
 #define TCP_REQUEST_QUEUE 1024
 #define EPOLL_EVENT_BUFFER_SIZE 256 // one page
 #define SERVER_STARTING_PORT 10000
+#define DURATION 10 // second
 
 static unsigned short n_threads = 4;
 static unsigned short n_server_ports = 16;
 static unsigned long n_connections = 10240;
 static in_addr_t server_address;
 
-static volatile unsigned char closing = 0; // client will close the connections when receiving response if closing become 1.
+static volatile unsigned char is_closing = 0; // client will close the connections when receiving response if is_closing become 1.
 static const char *request_msg;
 static const char *response_msg;
 static pthread_barrier_t barrier;
@@ -41,16 +42,18 @@ enum status {
     status_listening, status_reading, status_writing
 };
 
+struct statistic {
+    unsigned long long last_start_time;
+    unsigned int sessions;
+    double average_latency;
+};
+
 struct event_data {
     enum status status;
     int fd;
     int bytes_remaining;
 
-    struct {
-        unsigned long long last_start_time;
-        unsigned int sessions;
-        unsigned int running_average_latency;
-    } statistics;
+    struct statistic *statistic;
 };
 
 int server_listen(const unsigned short port) {
@@ -249,18 +252,19 @@ int client_connect(const unsigned short port) {
     return socket_fd;
 }
 
-int client_initialize_epoll(const unsigned long n_connections_local) {
+int client_initialize_epoll(struct statistic *const statistics) {
     const int epoll_fd = epoll_create(EPOLL_EVENT_BUFFER_SIZE);
     if (epoll_fd < 0)
         panic("Error creating epoll");
 
-    for (int i = 0; i < n_connections_local; i++) {
+    for (int i = 0; i < n_connections / n_threads; i++) {
         const int socket_fd = client_connect(SERVER_STARTING_PORT + i % n_server_ports);
 
         struct event_data *const event_data = malloc(sizeof(struct event_data));
         event_data->status = status_writing;
         event_data->fd = socket_fd;
         event_data->bytes_remaining = REQUEST_MSG_LEN;
+        event_data->statistic = statistics + i;
 
         struct epoll_event ev = {
             .events = EPOLLOUT,
@@ -277,6 +281,9 @@ int client_initialize_epoll(const unsigned long n_connections_local) {
 void client_handle_write(const int epoll_fd, struct event_data *const event_data, unsigned long *const remaining_connections) {
     const char *msg = request_msg + REQUEST_MSG_LEN - event_data->bytes_remaining;
     const int bytes_written = send(event_data->fd, msg, event_data->bytes_remaining, 0);
+
+    if (event_data->bytes_remaining == REQUEST_MSG_LEN) // first write, set start time
+        event_data->statistic->last_start_time = get_time_millis();
 
     if (bytes_written <= 0) {
         fprintf(stderr, "WARNING: writing failed, connection closed by server\n");
@@ -312,7 +319,17 @@ void client_handle_read(const int epoll_fd, struct event_data *const event_data,
     }
 
     if (event_data->bytes_remaining <= bytes_read) { // finished this session
-        if (closing) {
+        const double duration = get_time_millis() - event_data->statistic->last_start_time;
+        if (event_data->statistic->sessions == 0) { // special case to avoid divide by 0
+            event_data->statistic->average_latency = duration;
+        } else {
+            const double old = event_data->statistic->average_latency;
+            const double n = event_data->statistic->sessions;
+            event_data->statistic->average_latency = old * (n / (n + 1)) + duration / (n + 1);
+        }
+        event_data->statistic->sessions += 1;
+
+        if (is_closing) {
             close(event_data->fd);
             free(event_data);
             *remaining_connections -= 1;
@@ -330,14 +347,11 @@ void client_handle_read(const int epoll_fd, struct event_data *const event_data,
     }
 }
 
-void client_run(const unsigned short rank) {
-    const unsigned long n_connections_local = n_connections / n_threads;
-    const int epoll_fd = client_initialize_epoll(n_connections_local);
-
+void client_poll(const int epoll_fd) {
     pthread_barrier_wait(&barrier);
 
     struct epoll_event event_buffer[EPOLL_EVENT_BUFFER_SIZE];
-    unsigned long remaining_connections = n_connections_local;
+    unsigned long remaining_connections = n_connections / n_threads;
 
     while (remaining_connections) {
         const int n_events = epoll_wait(epoll_fd, event_buffer, EPOLL_EVENT_BUFFER_SIZE, -1);
@@ -361,14 +375,48 @@ void client_run(const unsigned short rank) {
 }
 
 void *client_thread_entry(void *ptr) {
-    const unsigned short rank = (unsigned short) (size_t) ptr;
-    client_run(rank);
+    const int epoll_fd = client_initialize_epoll(ptr);
+    client_poll(epoll_fd);
     return NULL;
+}
+
+void report_statistics(struct statistic *const statistics) {
+    const double n = n_connections;
+    
+    double total_sessions = 0;
+    for (int i = 0; i < n; i++)
+        total_sessions += statistics[i].sessions;
+    
+    double latency_mean = 0;
+    for (int i = 0; i < n; i++)
+        latency_mean += statistics[i].average_latency * (double) statistics[i].sessions / total_sessions;
+
+    double latency_var = 0;
+    for (int i = 0; i < n; i++) {
+        const double d = statistics[i].average_latency - latency_mean;
+        latency_var += d * d / (n - 1);
+    }
+
+    double sessions_mean = total_sessions / n;
+
+    double sessions_var = 0;
+    for (int i = 0; i < n; i++) {
+        const double d = (double) statistics[i].sessions - sessions_mean;
+        sessions_var += d * d / (n - 1);
+    }
+
+    fputc('\n', stderr);
+    fprintf(stderr, "Latency: avg %.2fms, var %.2fms\n", latency_mean, latency_var);
+    fprintf(stderr, "Sessions: avg %.2f, var %.2f\n", sessions_mean, sessions_var);
+    fprintf(stderr, "Total Requests/s: %.2f\n", total_sessions / DURATION);
+    fprintf(stderr, "Total Transfer/s: %.2fMB\n", total_sessions * RESPONSE_MSG_LEN / 1024 / 1024 / DURATION);
 }
 
 void client_entry() {
     request_msg = malloc(REQUEST_MSG_LEN); // leaked
     // strcpy(request_msg, "request");
+    
+    struct statistic *const all_statistics = calloc(sizeof(struct statistic), n_connections); // leaked
 
     const unsigned long long staring_time = get_time_millis();
     pthread_barrier_init(&barrier, NULL, n_threads + 1); // worker threads as well as this thread. The barrier is leaked. (no destroying)
@@ -376,27 +424,26 @@ void client_entry() {
 
     pthread_t *const threads = malloc(sizeof(pthread_t) * n_threads); // leaked
     for (unsigned short i = 0; i < n_threads; i++) {
-        const int error = pthread_create(threads + i, NULL, client_thread_entry, (void *) (size_t) i);
+        const int error = pthread_create(threads + i, NULL, client_thread_entry, all_statistics + n_connections / n_threads * i);
         if (error) panic("Error spawning thread");
     }
 
     pthread_barrier_wait(&barrier);
     fprintf(stderr, "connections established. elapsed: %lldms\n", get_time_millis() - staring_time);
 
-    const char is_oneshot = closing;
+    const char is_oneshot = is_closing;
 
     if (!is_oneshot) {
-        sleep(10);
-        closing = 1; // we only do simple store and load (no fetch_xx or CAS), so no need for atomics
+        sleep(DURATION);
+        is_closing = 1; // we only do simple store and load (no fetch_xx or CAS), so no need for atomics
     }
 
     for (unsigned short i = 0; i < n_threads; i++)
         pthread_join(threads[i], NULL);
 
-    if (is_oneshot) {
-        fprintf(stderr, "finished. elapsed: %lldms\n", get_time_millis() - staring_time);
-    } else {
-        // TODO: report statistics about each connection
+    fprintf(stderr, "finished. elapsed: %lldms\n", get_time_millis() - staring_time);
+    if (!is_oneshot) {
+        report_statistics(all_statistics);
     }
 }
 
@@ -425,7 +472,7 @@ int main(const int argc, char *const argv[]) {
                 n_connections = atoi(optarg);
                 break;
             case 'o': // one-shot
-                closing = 1;
+                is_closing = 1;
                 break;
             case 'h': // help
                 role = 'h';
