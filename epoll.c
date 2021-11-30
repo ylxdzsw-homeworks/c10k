@@ -26,8 +26,8 @@ static unsigned short n_threads = 4;
 static unsigned short n_server_ports = 16;
 static unsigned long n_connections = 10240;
 static in_addr_t server_address;
-static volatile unsigned char closing = 0; // client will close the connections when receiving response if closing become 1.
 
+static volatile unsigned char closing = 0; // client will close the connections when receiving response if closing become 1.
 static const char *request_msg;
 static const char *response_msg;
 static pthread_barrier_t barrier;
@@ -47,6 +47,7 @@ struct event_data {
     int bytes_remaining;
 
     struct {
+        unsigned long long last_start_time;
         unsigned int sessions;
         unsigned int running_average_latency;
     } statistics;
@@ -248,9 +249,7 @@ int client_connect(const unsigned short port) {
     return socket_fd;
 }
 
-void client_run(const unsigned short rank) {
-    const unsigned long n_connections_local = n_connections / n_threads;
-
+int client_initialize_epoll(const unsigned long n_connections_local) {
     const int epoll_fd = epoll_create(EPOLL_EVENT_BUFFER_SIZE);
     if (epoll_fd < 0)
         panic("Error creating epoll");
@@ -272,6 +271,69 @@ void client_run(const unsigned short rank) {
             panic("Error adding to epoll");
     }
 
+    return epoll_fd;
+}
+
+void client_handle_write(const int epoll_fd, struct event_data *const event_data, unsigned long *const remaining_connections) {
+    const char *msg = request_msg + REQUEST_MSG_LEN - event_data->bytes_remaining;
+    const int bytes_written = send(event_data->fd, msg, event_data->bytes_remaining, 0);
+
+    if (bytes_written <= 0) {
+        fprintf(stderr, "WARNING: writing failed, connection closed by server\n");
+        close(event_data->fd);
+        free(event_data);
+        *remaining_connections -= 1;
+        return;
+    }
+
+    if (event_data->bytes_remaining <= bytes_written) { // request finished, now write response
+        struct epoll_event ev = {
+            .events = EPOLLIN,
+            .data.ptr = event_data
+        };
+        epoll_ctl(epoll_fd, EPOLL_CTL_MOD, event_data->fd, &ev);
+        event_data->status = status_reading;
+        event_data->bytes_remaining = RESPONSE_MSG_LEN;
+    } else { // not finished, continue waiting
+        event_data->bytes_remaining -= bytes_written;
+    }
+}
+
+void client_handle_read(const int epoll_fd, struct event_data *const event_data, unsigned long *const remaining_connections) {
+    char buffer[RESPONSE_MSG_LEN];
+    const int bytes_read = recv(event_data->fd, buffer, event_data->bytes_remaining, 0);
+
+    if (bytes_read <= 0) {
+        fprintf(stderr, "WARNING: reading failed, connection closed by server\n");
+        close(event_data->fd);
+        free(event_data);
+        *remaining_connections -= 1;
+        return;
+    }
+
+    if (event_data->bytes_remaining <= bytes_read) { // finished this session
+        if (closing) {
+            close(event_data->fd);
+            free(event_data);
+            *remaining_connections -= 1;
+        } else { // start next session
+            struct epoll_event ev = {
+                .events = EPOLLOUT,
+                .data.ptr = event_data
+            };
+            epoll_ctl(epoll_fd, EPOLL_CTL_MOD, event_data->fd, &ev);
+            event_data->status = status_writing;
+            event_data->bytes_remaining = REQUEST_MSG_LEN;
+        }
+    } else { // not finished, continue reading
+        event_data->bytes_remaining -= bytes_read;
+    }
+}
+
+void client_run(const unsigned short rank) {
+    const unsigned long n_connections_local = n_connections / n_threads;
+    const int epoll_fd = client_initialize_epoll(n_connections_local);
+
     pthread_barrier_wait(&barrier);
 
     struct epoll_event event_buffer[EPOLL_EVENT_BUFFER_SIZE];
@@ -287,56 +349,11 @@ void client_run(const unsigned short rank) {
             struct event_data *const event_data = event_buffer[i].data.ptr;
             switch (event_data->status) {
                 case status_writing: ;
-                    const char *msg = request_msg + REQUEST_MSG_LEN - event_data->bytes_remaining;
-                    const int bytes_written = send(event_data->fd, msg, event_data->bytes_remaining, 0);
-
-                    if (bytes_written <= 0) {
-                        fprintf(stderr, "WARNING: writing failed, connection closed by server\n");
-                        epoll_ctl(epoll_fd, EPOLL_CTL_DEL, event_data->fd, NULL);
-                        shutdown(event_data->fd, SHUT_RDWR);
-                        close(event_data->fd);
-                        free(event_data);
-                        remaining_connections -= 1;
-                        continue;
-                    }
-
-                    if (event_data->bytes_remaining <= bytes_written) { // request finished, now write response
-                        struct epoll_event ev = {
-                            .events = EPOLLIN,
-                            .data.ptr = event_data
-                        };
-                        epoll_ctl(epoll_fd, EPOLL_CTL_MOD, event_data->fd, &ev);
-                        shutdown(event_data->fd, SHUT_WR);
-                        event_data->status = status_reading;
-                        event_data->bytes_remaining = RESPONSE_MSG_LEN;
-                    } else { // not finished, continue waiting
-                        event_data->bytes_remaining -= bytes_written;
-                    }
+                    client_handle_write(epoll_fd, event_data, &remaining_connections);
                     break;
 
                 case status_reading: ;
-                    char buffer[RESPONSE_MSG_LEN];
-                    const int bytes_read = recv(event_data->fd, buffer, event_data->bytes_remaining, 0);
-
-                    if (bytes_read <= 0) {
-                        fprintf(stderr, "WARNING: reading failed, connection closed by server\n");
-                        epoll_ctl(epoll_fd, EPOLL_CTL_DEL, event_data->fd, NULL);
-                        shutdown(event_data->fd, SHUT_RDWR);
-                        close(event_data->fd);
-                        free(event_data);
-                        remaining_connections -= 1;
-                        continue;
-                    }
-
-                    if (event_data->bytes_remaining <= bytes_read) { // finished this session
-                        epoll_ctl(epoll_fd, EPOLL_CTL_DEL, event_data->fd, NULL);
-                        shutdown(event_data->fd, SHUT_RD);
-                        close(event_data->fd);
-                        free(event_data);
-                        remaining_connections -= 1;
-                    } else { // not finished, continue reading
-                        event_data->bytes_remaining -= bytes_read;
-                    }
+                    client_handle_read(epoll_fd, event_data, &remaining_connections);
                     break;
             }
         }
