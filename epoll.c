@@ -19,42 +19,22 @@
 #define RESPONSE_MSG_LEN 512
 
 #define TCP_REQUEST_QUEUE 1024
-#define EPOLL_EVENT_BUFFER_SIZE 256 // one page long
+#define EPOLL_EVENT_BUFFER_SIZE 256 // one page
 #define SERVER_STARTING_PORT 10000
 
 static unsigned short n_threads = 4;
 static unsigned short n_server_ports = 16;
-static unsigned long n_connections = 10000;
+static unsigned long n_connections = 10240;
+static in_addr_t server_address;
+static volatile unsigned char closing = 0; // client will close the connections when receiving response if closing become 1.
+
 static const char *request_msg;
 static const char *response_msg;
-static in_addr_t server_address;
 static pthread_barrier_t barrier;
 
 void panic(const char *const msg) {
     perror(msg);
     exit(1);
-}
-
-int server_listen(const unsigned short port) {
-    const int socket_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (socket_fd < 0)
-        panic("Error creating socket");
-
-    const int reuse = 1;
-    setsockopt(socket_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-
-    struct sockaddr_in sockaddr = {0};
-    sockaddr.sin_family = AF_INET;
-    sockaddr.sin_port = htons(port);
-    sockaddr.sin_addr.s_addr = INADDR_ANY;
-
-    if (bind(socket_fd, (struct sockaddr *)&sockaddr, sizeof(sockaddr)) < 0)
-        panic("Error binding socket");
-
-    if (listen(socket_fd, TCP_REQUEST_QUEUE) < 0)
-        panic("Error listening");
-
-    return socket_fd;
 }
 
 enum status {
@@ -65,30 +45,136 @@ struct event_data {
     enum status status;
     int fd;
     int bytes_remaining;
+
+    struct {
+        unsigned int sessions;
+        unsigned int running_average_latency;
+    } statistics;
 };
 
-void server_run(const unsigned short rank) {
+int server_listen(const unsigned short port) {
+    const int socket_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (socket_fd < 0)
+        panic("Error creating socket");
+
+    const int reuse = 1;
+    setsockopt(socket_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+
+    struct sockaddr_in sockaddr = {
+        .sin_family = AF_INET,
+        .sin_port = htons(port),
+        .sin_addr.s_addr = INADDR_ANY
+    };
+
+    if (bind(socket_fd, (struct sockaddr *)&sockaddr, sizeof(sockaddr)) < 0)
+        panic("Error binding socket");
+
+    if (listen(socket_fd, TCP_REQUEST_QUEUE) < 0)
+        panic("Error listening");
+
+    return socket_fd;
+}
+
+int server_initialize_epoll(const unsigned short rank) {
     const unsigned short num_ports = n_server_ports / n_threads;
     const unsigned short port_offset = SERVER_STARTING_PORT + rank * num_ports;
 
-    int epoll_fd = epoll_create(EPOLL_EVENT_BUFFER_SIZE); // a single epoll for a thread. The size parameter is unused in Linux
+    const int epoll_fd = epoll_create(EPOLL_EVENT_BUFFER_SIZE); // a single epoll for a thread. The size parameter is unused in Linux
     if (epoll_fd < 0)
         panic("Error creating epoll");
 
     for (int i = 0; i < num_ports; i++) {
-        int socket_fd = server_listen(port_offset + i);
+        const int socket_fd = server_listen(port_offset + i);
 
         struct event_data *const event_data = malloc(sizeof(struct event_data)); // leaked
         event_data->status = status_listening;
         event_data->fd = socket_fd;
 
-        struct epoll_event ev;
-        ev.events = EPOLLIN;
-        ev.data.ptr = event_data;
+        struct epoll_event ev = {
+            .events = EPOLLIN,
+            .data.ptr = event_data
+        };
+
         if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, socket_fd, &ev) < 0)
             panic("Error adding listener to epoll");
     }
 
+    return epoll_fd;
+}
+
+void server_handle_listen(const int epoll_fd, struct event_data *const event_data) {
+    const int socket_fd = accept4(event_data->fd, NULL, NULL, SOCK_NONBLOCK);
+    if (socket_fd < 0)
+        panic("Error accepting connection");
+
+    struct event_data *const event_data_conn = malloc(sizeof(struct event_data));
+    event_data_conn->status = status_reading;
+    event_data_conn->fd = socket_fd;
+    event_data_conn->bytes_remaining = REQUEST_MSG_LEN;
+
+    struct epoll_event ev = {
+        .events = EPOLLIN,
+        .data.ptr = event_data_conn
+    };
+
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, socket_fd, &ev) < 0)
+        panic("Error adding socket to epoll");
+}
+
+void server_handle_read(const int epoll_fd, struct event_data *const event_data) {
+    char buffer[REQUEST_MSG_LEN];
+    const int bytes_read = recv(event_data->fd, buffer, event_data->bytes_remaining, 0);
+
+    if (bytes_read <= 0) {
+        if (event_data->bytes_remaining < REQUEST_MSG_LEN)
+            fprintf(stderr, "WARNING: reading failed, connection closed by client\n");
+        close(event_data->fd); // This automatically remove it from the epoll and send FIN.
+        free(event_data);
+        return;
+    }
+
+    if (event_data->bytes_remaining <= bytes_read) { // request finished, now write response
+        struct epoll_event ev = {
+            .events = EPOLLOUT,
+            .data.ptr = event_data
+        };
+
+        if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, event_data->fd, &ev) < 0)
+            panic("Error modifying interest in epoll");
+        event_data->status = status_writing;
+        event_data->bytes_remaining = RESPONSE_MSG_LEN;
+    } else { // not finished, continue waiting
+        event_data->bytes_remaining -= bytes_read;
+    }
+}
+
+void server_handle_write(const int epoll_fd, struct event_data *const event_data) {
+    const char *msg = response_msg + RESPONSE_MSG_LEN - event_data->bytes_remaining;
+    const int bytes_written = send(event_data->fd, msg, event_data->bytes_remaining, 0);
+
+    if (bytes_written <= 0) {
+        fprintf(stderr, "WARNING: writing failed, connection closed by client\n");
+        close(event_data->fd);
+        free(event_data);
+        return;
+    }
+
+    if (event_data->bytes_remaining <= bytes_written) { // response finished, now write the next response
+        struct epoll_event ev = {
+            .events = EPOLLIN,
+            .data.ptr = event_data
+        };
+
+        if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, event_data->fd, &ev) < 0)
+            panic("Error modifying interest in epoll");
+        event_data->status = status_reading;
+        event_data->bytes_remaining = REQUEST_MSG_LEN;
+    } else { // not finished, continue writing
+        event_data->bytes_remaining -= bytes_written;
+    }
+}
+
+void server_poll(const int epoll_fd) {
     struct epoll_event event_buffer[EPOLL_EVENT_BUFFER_SIZE];
 
     while (1) {
@@ -101,69 +187,15 @@ void server_run(const unsigned short rank) {
             struct event_data *const event_data = event_buffer[i].data.ptr;
             switch (event_data->status) {
                 case status_listening: ;
-                    const int socket_fd = accept4(event_data->fd, NULL, NULL, SOCK_NONBLOCK);
-                    if (socket_fd < 0)
-                        panic("Error accepting connection");
-
-                    struct event_data *const event_data_conn = malloc(sizeof(struct event_data)); // freed when the connection closed
-                    event_data_conn->status = status_reading;
-                    event_data_conn->fd = socket_fd;
-                    event_data_conn->bytes_remaining = REQUEST_MSG_LEN;
-
-                    struct epoll_event ev;
-                    ev.events = EPOLLIN;
-                    ev.data.ptr = event_data_conn;
-                    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, socket_fd, &ev) < 0)
-                        panic("Error adding socket to epoll");
+                    server_handle_listen(epoll_fd, event_data);
                     break;
 
                 case status_reading: ;
-                    char buffer[REQUEST_MSG_LEN];
-                    const int bytes_read = recv(event_data->fd, buffer, event_data->bytes_remaining, 0);
-
-                    if (bytes_read <= 0) {
-                        fprintf(stderr, "WARNING: reading failed, connection closed by client\n");
-                        epoll_ctl(epoll_fd, EPOLL_CTL_DEL, event_data->fd, NULL);
-                        shutdown(event_data->fd, SHUT_RDWR);
-                        close(event_data->fd);
-                        free(event_data);
-                        continue;
-                    }
-
-                    if (event_data->bytes_remaining <= bytes_read) { // request finished, now write response
-                        struct epoll_event ev;
-                        ev.events = EPOLLOUT;
-                        ev.data.ptr = event_data;
-                        epoll_ctl(epoll_fd, EPOLL_CTL_MOD, event_data->fd, &ev);
-                        shutdown(event_data->fd, SHUT_RD);
-                        event_data->status = status_writing;
-                        event_data->bytes_remaining = RESPONSE_MSG_LEN;
-                    } else { // not finished, continue waiting
-                        event_data->bytes_remaining -= bytes_read;
-                    }
+                    server_handle_read(epoll_fd, event_data);
                     break;
 
                 case status_writing: ;
-                    const char *msg = response_msg + RESPONSE_MSG_LEN - event_data->bytes_remaining;
-                    const int bytes_written = send(event_data->fd, msg, event_data->bytes_remaining, 0);
-
-                    if (bytes_written <= 0) {
-                        fprintf(stderr, "WARNING: writing failed, connection closed by client\n");
-                        epoll_ctl(epoll_fd, EPOLL_CTL_DEL, event_data->fd, NULL);
-                        shutdown(event_data->fd, SHUT_RDWR);
-                        close(event_data->fd);
-                        free(event_data);
-                        continue;
-                    }
-
-                    if (event_data->bytes_remaining <= bytes_written) { // response finished, closing the socket
-                        epoll_ctl(epoll_fd, EPOLL_CTL_DEL, event_data->fd, NULL);
-                        shutdown(event_data->fd, SHUT_WR);
-                        close(event_data->fd);
-                        free(event_data);
-                    } else { // not finished, continue writing
-                        event_data->bytes_remaining -= bytes_written;
-                    }
+                    server_handle_write(epoll_fd, event_data);
                     break;
             }
         }
@@ -172,7 +204,8 @@ void server_run(const unsigned short rank) {
 
 void *server_thread_entry(void *ptr) {
     const unsigned short rank = (unsigned short) (size_t) ptr;
-    server_run(rank);
+    const int epoll_fd = server_initialize_epoll(rank);
+    server_poll(epoll_fd);
     return NULL;
 }
 
@@ -203,10 +236,11 @@ int client_connect(const unsigned short port) {
     if (socket_fd < 0)
         panic("Error creating socket");
 
-    struct sockaddr_in sockaddr = {0};
-    sockaddr.sin_family = AF_INET;
-    sockaddr.sin_port = htons(port);
-    sockaddr.sin_addr.s_addr = server_address;
+    struct sockaddr_in sockaddr = {
+        .sin_family = AF_INET,
+        .sin_port = htons(port),
+        .sin_addr.s_addr = server_address
+    };
 
     if (connect(socket_fd, (struct sockaddr *)&sockaddr, sizeof(sockaddr)) < 0)
         panic("Error connecting");
@@ -217,21 +251,23 @@ int client_connect(const unsigned short port) {
 void client_run(const unsigned short rank) {
     const unsigned long n_connections_local = n_connections / n_threads;
 
-    int epoll_fd = epoll_create(EPOLL_EVENT_BUFFER_SIZE);
+    const int epoll_fd = epoll_create(EPOLL_EVENT_BUFFER_SIZE);
     if (epoll_fd < 0)
         panic("Error creating epoll");
 
     for (int i = 0; i < n_connections_local; i++) {
-        int socket_fd = client_connect(SERVER_STARTING_PORT + i % n_server_ports);
+        const int socket_fd = client_connect(SERVER_STARTING_PORT + i % n_server_ports);
 
-        struct event_data *const event_data = malloc(sizeof(struct event_data)); // freeed when connection closed
+        struct event_data *const event_data = malloc(sizeof(struct event_data));
         event_data->status = status_writing;
         event_data->fd = socket_fd;
         event_data->bytes_remaining = REQUEST_MSG_LEN;
 
-        struct epoll_event ev;
-        ev.events = EPOLLOUT;
-        ev.data.ptr = event_data;
+        struct epoll_event ev = {
+            .events = EPOLLOUT,
+            .data.ptr = event_data
+        };
+
         if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, socket_fd, &ev) < 0)
             panic("Error adding to epoll");
     }
@@ -265,9 +301,10 @@ void client_run(const unsigned short rank) {
                     }
 
                     if (event_data->bytes_remaining <= bytes_written) { // request finished, now write response
-                        struct epoll_event ev;
-                        ev.events = EPOLLIN;
-                        ev.data.ptr = event_data;
+                        struct epoll_event ev = {
+                            .events = EPOLLIN,
+                            .data.ptr = event_data
+                        };
                         epoll_ctl(epoll_fd, EPOLL_CTL_MOD, event_data->fd, &ev);
                         shutdown(event_data->fd, SHUT_WR);
                         event_data->status = status_reading;
@@ -291,7 +328,7 @@ void client_run(const unsigned short rank) {
                         continue;
                     }
 
-                    if (event_data->bytes_remaining <= bytes_read) {
+                    if (event_data->bytes_remaining <= bytes_read) { // finished this session
                         epoll_ctl(epoll_fd, EPOLL_CTL_DEL, event_data->fd, NULL);
                         shutdown(event_data->fd, SHUT_RD);
                         close(event_data->fd);
@@ -316,52 +353,65 @@ void client_entry() {
     request_msg = malloc(REQUEST_MSG_LEN); // leaked
     // strcpy(request_msg, "request");
 
-    unsigned long long staring_time = get_time_millis();
+    const unsigned long long staring_time = get_time_millis();
     pthread_barrier_init(&barrier, NULL, n_threads + 1); // worker threads as well as this thread. The barrier is leaked. (no destroying)
-    printf("initiating connections\n");
+    fprintf(stderr, "initiating connections\n");
 
     pthread_t *const threads = malloc(sizeof(pthread_t) * n_threads); // leaked
     for (unsigned short i = 0; i < n_threads; i++) {
-        int error = pthread_create(threads + i, NULL, client_thread_entry, (void *) (size_t) i);
+        const int error = pthread_create(threads + i, NULL, client_thread_entry, (void *) (size_t) i);
         if (error) panic("Error spawning thread");
     }
 
     pthread_barrier_wait(&barrier);
-    printf("connections established. elapsed: %lldms\n", get_time_millis() - staring_time);
+    fprintf(stderr, "connections established. elapsed: %lldms\n", get_time_millis() - staring_time);
 
-    for (unsigned short i = 0; i < n_threads; i++) {
-        pthread_join(threads[i], NULL);
+    const char is_oneshot = closing;
+
+    if (!is_oneshot) {
+        sleep(10);
+        closing = 1; // we only do simple store and load (no fetch_xx or CAS), so no need for atomics
     }
 
-    printf("finished. elapsed: %lldms\n", get_time_millis() - staring_time);
+    for (unsigned short i = 0; i < n_threads; i++)
+        pthread_join(threads[i], NULL);
+
+    if (is_oneshot) {
+        fprintf(stderr, "finished. elapsed: %lldms\n", get_time_millis() - staring_time);
+    } else {
+        // TODO: report statistics about each connection
+    }
 }
 
 int main(const int argc, char *const argv[]) {
     char role = 'h';
     int opt;
 
-    while ((opt = getopt(argc, argv, "sct:p:a:n:h")) != -1) {
+    while ((opt = getopt(argc, argv, "sct:p:a:n:oh")) != -1) {
         switch (opt) {
-            case 's':
+            case 's': // server
                 role = 's';
                 break;
-            case 'c':
+            case 'c': // client
                 role = 'c';
                 break;
-            case 't':
+            case 't': // thread
                 n_threads = atoi(optarg);
                 break;
-            case 'p':
+            case 'p': // ports
                 n_server_ports = atoi(optarg);
                 break;
-            case 'a':
+            case 'a': // address
                 server_address = inet_addr(optarg);
                 break;
-            case 'n':
+            case 'n': // number of connections
                 n_connections = atoi(optarg);
                 break;
-            case 'h':
-                role = 'h'; // for help
+            case 'o': // one-shot
+                closing = 1;
+                break;
+            case 'h': // help
+                role = 'h';
                 break;
             default:
                 panic("Parsing commandline options failed");
@@ -384,8 +434,7 @@ int main(const int argc, char *const argv[]) {
             client_entry();
             break;
         case 'h':
-        default:
-            printf(
+            fprintf(stderr,
                 "Usage: epoll [options]\n"
                 " -s: run as server\n"
                 " -c: run as client\n"
@@ -393,6 +442,7 @@ int main(const int argc, char *const argv[]) {
                 " -p <ports>: number of server ports\n"
                 " -a <address>: server address (client-only)\n"
                 " -n <connections>: number of connections (client-only)\n"
+                " -o: each connection only sends request once\n"
                 " -h: show this help message\n"
             );
     }
