@@ -190,15 +190,15 @@ void server_poll(const int epoll_fd) {
         for (int i = 0; i < n_events; i++) {
             struct event_data *const event_data = event_buffer[i].data.ptr;
             switch (event_data->status) {
-                case status_listening: ;
+                case status_listening:
                     server_handle_listen(epoll_fd, event_data);
                     break;
 
-                case status_reading: ;
+                case status_reading:
                     server_handle_read(epoll_fd, event_data);
                     break;
 
-                case status_writing: ;
+                case status_writing:
                     server_handle_write(epoll_fd, event_data);
                     break;
             }
@@ -320,13 +320,9 @@ void client_handle_read(const int epoll_fd, struct event_data *const event_data,
 
     if (event_data->bytes_remaining <= bytes_read) { // finished this session
         const double duration = get_time_millis() - event_data->statistic->last_start_time;
-        if (event_data->statistic->sessions == 0) { // special case to avoid divide by 0
-            event_data->statistic->average_latency = duration;
-        } else {
-            const double old = event_data->statistic->average_latency;
-            const double n = event_data->statistic->sessions;
-            event_data->statistic->average_latency = old * (n / (n + 1)) + duration / (n + 1);
-        }
+        const double old = event_data->statistic->average_latency;
+        const double n = event_data->statistic->sessions;
+        event_data->statistic->average_latency = old * (n / (n + 1)) + duration / (n + 1);
         event_data->statistic->sessions += 1;
 
         if (is_closing) {
@@ -362,11 +358,11 @@ void client_poll(const int epoll_fd) {
         for (int i = 0; i < n_events; i++) {
             struct event_data *const event_data = event_buffer[i].data.ptr;
             switch (event_data->status) {
-                case status_writing: ;
+                case status_writing:
                     client_handle_write(epoll_fd, event_data, &remaining_connections);
                     break;
 
-                case status_reading: ;
+                case status_reading:
                     client_handle_read(epoll_fd, event_data, &remaining_connections);
                     break;
             }
