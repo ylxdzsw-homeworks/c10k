@@ -411,7 +411,7 @@ void report_statistics(struct statistic *const statistics) {
 void client_entry() {
     request_msg = malloc(REQUEST_MSG_LEN); // leaked
     // strcpy(request_msg, "request");
-    
+
     struct statistic *const all_statistics = calloc(sizeof(struct statistic), n_connections); // leaked
 
     const unsigned long long staring_time = get_time_millis();
@@ -425,7 +425,7 @@ void client_entry() {
     }
 
     pthread_barrier_wait(&barrier);
-    fprintf(stderr, "connections established. elapsed: %lldms\n", get_time_millis() - staring_time);
+    fprintf(stderr, "connections established. elapsed: %llums\n", get_time_millis() - staring_time);
 
     const char is_oneshot = is_closing;
 
@@ -437,10 +437,9 @@ void client_entry() {
     for (unsigned short i = 0; i < n_threads; i++)
         pthread_join(threads[i], NULL);
 
-    fprintf(stderr, "finished. elapsed: %lldms\n", get_time_millis() - staring_time);
-    if (!is_oneshot) {
+    fprintf(stderr, "finished. elapsed: %llums\n", get_time_millis() - staring_time);
+    if (!is_oneshot)
         report_statistics(all_statistics);
-    }
 }
 
 int main(const int argc, char *const argv[]) {
@@ -502,7 +501,7 @@ int main(const int argc, char *const argv[]) {
                 " -p <ports>: number of server ports\n"
                 " -a <address>: server address (client-only)\n"
                 " -n <connections>: number of connections (client-only)\n"
-                " -o: each connection only sends request once\n"
+                " -o: each connection only sends request once (client-only)\n"
                 " -h: show this help message\n"
             );
     }
